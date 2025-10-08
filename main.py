@@ -3,17 +3,24 @@ import os
 import nest_asyncio
 import asyncio
 from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+import io
+from docx import Document
 
 # Import Playwright-based scraper
 from scrape_playwright import scrape_website_playwright as scrape_website
 from crawler import WebCrawler
 
 # Helper functions for cleaning and parsing
-from scrape import extract_body_content, clean_body_content, split_dom_content
-# from parse import parse_with_ollama  # optional LLM parsing if needed
+from scrape import extract_body_content, clean_body_content
+
+# LLM cleaning utility
+from llm import clean_content_via_llm, chunk_content_via_llm
+
+# Logger
+from logger import logger
+
+# Load environment variables
+load_dotenv()
 
 # Detect scraping mode
 SCRAPING_MODE = os.getenv("SCRAPING_MODE", "playwright")
@@ -90,9 +97,20 @@ if st.button("🚀 Start Scraping"):
             st.info("📄 Scraping single page using Playwright...")
             html = asyncio.run(scrape_website(url))
             body = extract_body_content(html)
-            cleaned = clean_body_content(body)
+            # First perform basic cleaning, then enhance with LLM
+            raw_cleaned = clean_body_content(body)
+            # Store raw (basic) cleaned content for display
+            st.session_state.raw_content = raw_cleaned
+            try:
+                llm_cleaned = clean_content_via_llm(raw_cleaned)
+            except Exception as e:
+                logger.error(f"LLM cleaning failed: {e}")
+                llm_cleaned = raw_cleaned
 
-            st.session_state.dom_content = cleaned
+            # Store both raw and LLM‑cleaned versions
+            st.session_state.cleaned_content = llm_cleaned
+            # Keep backward‑compatible key used by the UI
+            st.session_state.dom_content = llm_cleaned
             st.session_state.scraped_urls = [url]
 
         else:
@@ -104,7 +122,19 @@ if st.button("🚀 Start Scraping"):
             combined_content = crawler.get_all_content()
             stats = crawler.get_crawl_stats()
 
-            st.session_state.dom_content = combined_content
+            # Clean the combined content using LLM
+            try:
+                llm_cleaned = clean_content_via_llm(combined_content)
+            except Exception as e:
+                logger.error(f"LLM cleaning failed: {e}")
+                llm_cleaned = combined_content
+
+            # Store raw and cleaned versions
+            st.session_state.raw_content = combined_content
+            st.session_state.cleaned_content = llm_cleaned
+            st.session_state.dom_content = (
+                llm_cleaned  # keep existing key for backward compatibility
+            )
             st.session_state.scraped_urls = stats["visited_urls"]
             st.session_state.crawl_stats = stats
 
@@ -113,10 +143,56 @@ if st.button("🚀 Start Scraping"):
 # ───────────────────────────────────────── VIEW CONTENT ─────────────────────────────────────────
 if "dom_content" in st.session_state:
     st.subheader("📄 Scraped Content")
-    with st.expander("🔍 View Scraped Content"):
-        st.text_area("Text Content", st.session_state.dom_content, height=400)
+    with st.expander("🔍 View LLM‑Cleaned Content"):
+        st.text_area("Cleaned Text", st.session_state.dom_content, height=400)
+        # Add download button for the cleaned content as a Word document
+        doc2 = Document()
+        doc2.add_paragraph(st.session_state.dom_content)
+        buf2 = io.BytesIO()
+        doc2.save(buf2)
+        buf2.seek(0)
+        st.download_button(
+            label="Download Cleaned Content (DOCX)",
+            data=buf2,
+            file_name="cleaned_content.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        # Button to chunk the cleaned content
+        if st.button("🔀 Chunk Cleaned Content"):
+            # Use LLM to create meaningful chunks
+            st.session_state.cleaned_chunks = chunk_content_via_llm(
+                st.session_state.dom_content
+            )
+            st.success(f"Created {len(st.session_state.cleaned_chunks)} chunks")
+
+    # Show raw (basic) cleaned content if available
+    if "raw_content" in st.session_state:
+        with st.expander("🔎 View Raw Cleaned Content (pre‑LLM)"):
+            st.text_area("Raw Text", st.session_state.raw_content, height=400)
+            # Download button for the raw scraped content (pre‑LLM)
+            st.markdown("---")
+            st.subheader("💾 Download Raw Scraped Data")
+            doc_raw = Document()
+            doc_raw.add_paragraph(st.session_state.raw_content)
+            buf_raw = io.BytesIO()
+            doc_raw.save(buf_raw)
+            buf_raw.seek(0)
+            st.download_button(
+                label="Download Raw Content (DOCX)",
+                data=buf_raw,
+                file_name="raw_content.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+    # Display chunks if they exist
+    if "cleaned_chunks" in st.session_state:
+        st.subheader("📑 Cleaned Content Chunks")
+        for idx, chunk in enumerate(st.session_state.cleaned_chunks, 1):
+            with st.expander(f"Chunk {idx} (words: {len(chunk.split())})"):
+                st.write(chunk)
 
     if "scraped_urls" in st.session_state:
+        st.subheader("🔗 Scraped URLs")
         with st.expander(f"🔗 Scraped URLs ({len(st.session_state.scraped_urls)})"):
             for i, link in enumerate(st.session_state.scraped_urls, 1):
                 st.write(f"{i}. {link}")
